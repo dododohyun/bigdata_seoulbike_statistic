@@ -1,0 +1,31 @@
+# ===== 인증키 포함 파일 (절대 업로드 금지) =====
+api_config.py
+*.key
+.env
+
+# ===== 원본/대용량 데이터 =====
+rental_data_2024/
+weather_data/
+holiday_data/
+*.csv
+*.parquet
+# 단, 컬럼/사용법 예시용 작은 샘플은 필요 시 강제 추가: git add -f sample.csv
+
+# ===== 분석 산출물 =====
+outputs/
+
+# ===== Python 캐시/가상환경 =====
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.python-version
+
+# ===== 에디터/OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
