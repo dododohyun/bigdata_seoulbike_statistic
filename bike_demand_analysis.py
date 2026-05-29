@@ -50,6 +50,7 @@
 # [공통 설정] 라이브러리 / 경로 / 한글 폰트 / 실행 파라미터
 # =============================================================================
 import os
+import gc
 import warnings
 import numpy as np
 import pandas as pd
@@ -190,11 +191,21 @@ if station_info is None:
 
 summarize_df(station_info, "대여소 정보 (정제)")
 
+# 수치형 다운캐스트(메모리 절감) — 풀그리드(2천만+ 행) 병합 대비
+for _c in ["rack_count", "latitude", "longitude"]:
+    if _c in station_info.columns:
+        station_info[_c] = pd.to_numeric(station_info[_c], errors="coerce").astype("float32")
+
 # %%
-# --- 기상 데이터: datetime 파싱 ---
+# --- 기상 데이터: datetime 파싱 + 메모리 절감(필요 컬럼만, float32) ---
 weather = weather_raw.copy()
 weather["datetime"] = pd.to_datetime(weather["datetime"])
-# (이미 영문 컬럼: datetime, temperature, precipitation, humidity, wind_speed, temp_max, temp_min)
+# 모델·산출물에 실제로 쓰는 컬럼만 유지(temp_max/temp_min 미사용) → 풀그리드 병합 시 메모리 절감
+_w_use = ["datetime", "temperature", "precipitation", "humidity", "wind_speed"]
+weather = weather[[c for c in _w_use if c in weather.columns]]
+for _c in ["temperature", "precipitation", "humidity", "wind_speed"]:
+    if _c in weather.columns:
+        weather[_c] = weather[_c].astype("float32")
 
 # --- 공휴일 데이터: 2024년 공휴일 날짜 집합 ---
 holiday = holiday_raw.copy()
@@ -280,17 +291,27 @@ df["return_count"] = df["return_count"].astype("int32")
 df["net_flow"] = (df["return_count"] - df["rental_count"]).astype("int32")   # +면 유입(과잉), -면 유출(부족)
 print("full grid shape:", df.shape)
 
+# 그리드 생성에 쓴 대용량 중간 객체 해제(메모리 회수)
+del full_index, agg
+gc.collect()
+
 # %% [markdown]
 # ### 2-2. 날짜/시간 파생변수 생성
 
 # %%
 dt = df["datetime"]
-df["date"]        = dt.dt.date
+df["date"]        = dt.dt.normalize()                     # object(파이썬 date) 대신 datetime64로 보관(메모리 절감)
 df["hour"]        = dt.dt.hour.astype("int8")
 df["day_of_week"] = dt.dt.dayofweek.astype("int8")        # 0=월 ... 6=일
 df["is_weekend"]  = (df["day_of_week"] >= 5).astype("int8")
 df["month"]       = dt.dt.month.astype("int8")
-df["year_month"]  = dt.dt.strftime("%Y-%m")
+# year_month: strftime로 수천만 개 문자열을 만들지 않도록 (year, month) 코드 기반 category로 생성
+_yy = dt.dt.year.to_numpy()
+_mm = dt.dt.month.to_numpy()
+_years = np.unique(_yy)
+_ym_cats = [f"{int(y)}-{m:02d}" for y in _years for m in range(1, 13)]
+_ym_code = (np.searchsorted(_years, _yy) * 12 + (_mm - 1)).astype("int32")
+df["year_month"] = pd.Categorical.from_codes(_ym_code, categories=_ym_cats)
 
 _season_map = {12: "겨울", 1: "겨울", 2: "겨울", 3: "봄", 4: "봄", 5: "봄",
                6: "여름", 7: "여름", 8: "여름", 9: "가을", 10: "가을", 11: "가을"}
@@ -307,8 +328,9 @@ print(df[["datetime", "hour", "day_of_week", "is_weekend", "month", "season", "i
 # 기상 병합 (datetime 시간 단위 일치)
 df = df.merge(weather, on="datetime", how="left")
 
-# 공휴일 병합 (date 기준 플래그)
-df["is_holiday"] = df["date"].isin(holiday_2024).astype("int8")
+# 공휴일 병합 (date 기준 플래그) — date가 datetime64이므로 공휴일도 Timestamp로 변환해 비교
+_holiday_ts = pd.to_datetime(sorted(holiday_2024)) if holiday_2024 else pd.to_datetime([])
+df["is_holiday"] = df["date"].isin(_holiday_ts).astype("int8")
 # 휴무일(주말 또는 공휴일)
 df["is_dayoff"] = ((df["is_weekend"] == 1) | (df["is_holiday"] == 1)).astype("int8")
 
@@ -316,6 +338,11 @@ df["is_dayoff"] = ((df["is_weekend"] == 1) | (df["is_holiday"] == 1)).astype("in
 df = df.merge(station_info[["station_id", "station_name", "district",
                             "rack_count", "latitude", "longitude"]],
               on="station_id", how="left")
+
+# 텍스트 컬럼은 category로(2천만+ 행에서 object 문자열 메모리 절감) — 병합 키가 아니라 안전
+for _c in ["station_name", "district"]:
+    if _c in df.columns:
+        df[_c] = df[_c].astype("category")
 
 # --- 병합 후 결측 점검 ---
 print("병합 후 결측치 (있는 컬럼만):")
@@ -330,11 +357,11 @@ print(m[m > 0])
 #   존재할 때 발생. 위치 정보는 보간 불가 → 지도/공간분석에서는 제외하고, 수요 시계열 분석에는 그대로 유지한다.
 
 # %%
-# 기상 결측 보간
-weather_cols = ["temperature", "precipitation", "humidity", "wind_speed", "temp_max", "temp_min"]
-df = df.sort_values(["station_id", "datetime"])
+# 기상 결측 보간 (full grid가 from_product로 이미 station_id→datetime 순 정렬, left merge가 순서 보존 → 재정렬 불필요)
+weather_cols = ["temperature", "precipitation", "humidity", "wind_speed"]
 for c in weather_cols:
-    df[c] = df[c].interpolate(limit_direction="both")
+    if c in df.columns:
+        df[c] = df[c].interpolate(limit_direction="both").astype("float32")
 # 강수량 결측/음수 방어
 df["precipitation"] = df["precipitation"].fillna(0).clip(lower=0)
 print("기상 결측 처리 후 잔여 결측:")
@@ -347,25 +374,31 @@ print(df[weather_cols].isna().sum())
 # - **누수 방지**: 설명변수에는 *현재 시점 이하* 정보만 사용한다. 과거 수요 lag/rolling 변수는 `shift(+)`로 만들어 미래 정보 유입을 차단한다.
 
 # %%
-df = df.sort_values(["station_id", "datetime"]).reset_index(drop=True)
+# full grid는 from_product로 (station_id, datetime) 순 정렬 + left merge가 순서를 보존하므로 재정렬 생략
 g = df.groupby("station_id", observed=True)
 
-# 회귀 타깃: 다음 시간 대여량
-df["target_reg"] = g["rental_count"].shift(-1)
+# 회귀 타깃: 다음 시간 대여량 (NaN 포함이라 float, float32로 메모리 절감)
+df["target_reg"] = g["rental_count"].shift(-1).astype("float32")
 
 # 과거 수요 변수(누수 방지: 모두 과거 방향 shift)
-df["lag_1h"]   = g["rental_count"].shift(1)
-df["lag_24h"]  = g["rental_count"].shift(24)
-df["roll_24h"] = g["rental_count"].shift(1).rolling(24, min_periods=1).mean().reset_index(level=0, drop=True)
+df["lag_1h"]   = g["rental_count"].shift(1).astype("float32")
+df["lag_24h"]  = g["rental_count"].shift(24).astype("float32")
+df["roll_24h"] = (g["rental_count"].shift(1).rolling(24, min_periods=1).mean()
+                    .reset_index(level=0, drop=True).astype("float32"))
 
 # 분류 타깃: 대여소별 분위수(현재 rental_count 분포) → 다음 시간 수요(target_reg)를 등급화
+# merge로 q25/q75를 전 행(2천만+)에 붙이면 메모리 부담 → station_id map으로만 임시 사용(컬럼 미보관)
 q = df.groupby("station_id", observed=True)["rental_count"].quantile([0.25, 0.75]).unstack()
 q.columns = ["q25", "q75"]
-df = df.merge(q, on="station_id", how="left")
-df["target_cls"] = np.where(df["target_reg"] <= df["q25"], "Low",
-                     np.where(df["target_reg"] >= df["q75"], "High", "Normal"))
-df.loc[df["target_reg"].isna(), "target_cls"] = np.nan   # 마지막 시간은 타깃 없음
+_q25 = df["station_id"].map(q["q25"].astype("float32"))
+_q75 = df["station_id"].map(q["q75"].astype("float32"))
+_tr = df["target_reg"]
+df["target_cls"] = np.where(_tr <= _q25, "Low",
+                     np.where(_tr >= _q75, "High", "Normal"))
+df.loc[_tr.isna(), "target_cls"] = np.nan   # 마지막 시간은 타깃 없음
 df["target_cls"] = df["target_cls"].astype("category")
+del _q25, _q75
+gc.collect()
 
 # 각 대여소의 마지막 시간(타깃 없음) 행 확인
 print("target_reg 결측(=대여소별 마지막 시간) 행수:", df["target_reg"].isna().sum())
